@@ -594,7 +594,8 @@ void compare_weighted_results(
     if (max_dev > max_allowed_deviation) {
         throw std::runtime_error(
             "the actual counts deviate from the "
-            "theoretical weights (max deviation > " +
+            "theoretical weights (max deviation: " +
+            std::to_string(max_dev * 100) + "%, max allowed: " +
             std::to_string(max_allowed_deviation * 100) + "%)\n");
     }
 }
@@ -602,11 +603,11 @@ void compare_weighted_results(
 TEST_P(AllocationStrategyParameterizedTest, WeightedRandomAllocationStrategy) {
     auto [strategy_type, allocator_type] = GetParam();
     if (strategy_type != AllocationStrategyType::WEIGHTED_RANDOM) {
-        GTEST_SKIP()
-            << "This test is only for WeightedRandomAllocationStrategy.";
+        // This test is only for WeightedRandomAllocationStrategy
+        return;
     }
 
-    const auto kNumSegments = 3;
+    const auto kNumSegments = 300;
     const auto kSegmentBase = 0x100000000ULL;
     const auto kSegmentSize = 64 * MiB;
     std::array<size_t, kNumSegments> kWeights{};

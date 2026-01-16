@@ -335,37 +335,64 @@ class RandomAllocationStrategy : public AllocationStrategy {
     static constexpr size_t kMaxRetryLimit = 100;
 };
 
+/**
+ * @brief Weighted random batch allocation strategy using best-effort semantics.
+ *
+ * This strategy allocates buffers based on the available capacity of each
+ * allocator, favoring those with more free space. It ensures that for each
+ * slice, its replicas are placed in different segments. Different slices
+ * may use the same segments.
+ *
+ * Best-effort behavior:
+ * - Attempts to allocate the requested number of replicas
+ * - If insufficient segments are available, allocates as many replicas as
+ *   possible (limited by the number of available segments)
+ * - Only fails if no replicas can be allocated at all
+ */
 class WeightedRandomAllocationStrategy : public RandomAllocationStrategy {
+   private:
+    static constexpr uint64_t kWeightShift = 20;          // 1MB
+    static constexpr uint64_t kWeightMax = 1ULL << 30;  // 10GB
+
    public:
     WeightedRandomAllocationStrategy() = default;
     virtual ~WeightedRandomAllocationStrategy() = default;
 
-    // https://utopia.duth.gr/~pefraimi/research/data/2007EncOfAlg.pdf
-    // Section 3.2.2 Weighted Random Selection
+    // https://en.wikipedia.org/wiki/Fitness_proportionate_selection, Weighted
+    // Random Selection
     virtual std::vector<std::unique_ptr<AllocatedBuffer>> allocateBatch(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         std::mt19937& generator, const size_t expect_num,
-        std::function<bool(const std::string&)> exclude_func) override {
+        std::function<bool(const std::string&)> exclude_func) {
         struct Candidate {
             std::shared_ptr<BufferAllocatorBase> allocator;
-            uint64_t weight;  // in MegaBytes
+            uint64_t weight;
+            uint64_t cumulative_weights;
+            bool selected;
         };
 
         const auto& names = allocator_manager.getNames();
-
         std::vector<Candidate> candidates;
         candidates.reserve(names.size());
+
+        uint64_t total_weight = 0;
         for (const auto& name : names) {
             if (exclude_func && exclude_func(name)) continue;
 
             auto allocators = allocator_manager.getAllocators(name);
-            if (!allocators || allocators->size() == 0) continue;
+            if (!allocators || allocators->empty()) continue;
 
             for (const auto& alloc : *allocators) {
+                if (!alloc) continue;
+
                 uint64_t avail = alloc->capacity() - alloc->size();
                 if (avail > slice_length) {
-                    // convert available bytes to MegaBytes
-                    candidates.push_back({alloc, avail >> 20});
+                    uint64_t weight = avail >> kWeightShift;
+                    // If weight is larger than kWeightMax, it does not matter how much 
+                    // space it occupies, we just cap it to kWeightMax.
+                    if (weight > kWeightMax) weight = kWeightMax;
+                    total_weight += weight;
+                    candidates.push_back({alloc, weight, total_weight, false});
                 }
             }
         }
@@ -374,34 +401,30 @@ class WeightedRandomAllocationStrategy : public RandomAllocationStrategy {
             return {};
         }
 
-        // generate keys based on weighted random permutation
-        std::vector<std::pair<double, size_t>> keys;  // (key, index)
-        keys.reserve(candidates.size());
-
-        std::uniform_real_distribution<double> uniform_dist(
-            std::numeric_limits<double>::min(), 1.0);
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            double u = uniform_dist(generator);
-            double weight = static_cast<double>(candidates[i].weight);
-            double key = -std::log(u) / weight;
-            keys.emplace_back(key, i);
-        }
-
-        // sort keys in ascending order, the smaller key has higher priority
-        std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) {
-            return a.first < b.first;
-        });
-
-        // attempt assignment in sorted order without replacement
         std::vector<std::unique_ptr<AllocatedBuffer>> batch_buffers;
         batch_buffers.reserve(std::min(expect_num, candidates.size()));
 
-        for (const auto& [_, idx] : keys) {
-            if (batch_buffers.size() >= expect_num) break;
+        // Step 3: Selection loop (without replacement)
+        std::uniform_real_distribution<double> dist(0.0, total_weight);
+        for (size_t i = 0; i < expect_num && !candidates.empty(); ++i) {
+            double r = dist(generator);
+            for (const auto& c : candidates) {
+                if (c.selected) {
+                    // skip selected candidates and update r
+                    r += c.weight;
+                    continue;
+                }
 
-            auto& alloc = candidates[idx].allocator;
-            if (auto buffer = alloc->allocate(slice_length)) {
-                batch_buffers.emplace_back(std::move(buffer));
+                if (c.cumulative_weights < r) {
+                    continue;
+                }
+
+                c.selected = true;
+                const auto& alloc = c.allocator;
+                if (auto buffer = alloc->allocate(slice_length)) {
+                    batch_buffers.emplace_back(std::move(buffer));
+                }
+                break;
             }
         }
 
